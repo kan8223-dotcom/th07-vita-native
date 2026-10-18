@@ -58,6 +58,7 @@ cmake --build build
   Lineage: some100/th07 → kan8223-dotcom/th07-psp-native → this port.
 - `third_party/touhou-modern-vita` and `third_party/touhou_dls_common`: MIT.
 - Noto Sans JP: SIL Open Font License 1.1 ([licenses/NotoSansJP/](licenses/NotoSansJP/)).
+- Saekaze (formerly Swiizyu) — native Switch ports ([saekaze/touhou-switch](https://github.com/saekaze/touhou-switch)); the spark that started this series of ports.
 - Statically linked libraries: [THIRD_PARTY.md](THIRD_PARTY.md). Credits: [CREDITS.md](CREDITS.md).
 
 This software uses the FreeType Project font engine.

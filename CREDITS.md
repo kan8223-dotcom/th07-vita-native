@@ -27,6 +27,7 @@
 
 ## 謝辞
 
+- 冴風（Saekaze、旧 Swiizyu）さん — 東方 Project の Switch ネイティブ移植（[saekaze/touhou-switch](https://github.com/saekaze/touhou-switch)）。この一連の移植のきっかけになりました。
 - HENkaku / Ensō、VitaShell — Vita homebrew の基盤。
 - 移植: kan82、OpenAI Codex、Anthropic Claude。
 

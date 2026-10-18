@@ -107,6 +107,7 @@ cmake --build build
 - 経路: some100/th07（portable branch）→ [kan8223-dotcom/th07-psp-native](https://github.com/kan8223-dotcom/th07-psp-native) → この Vita 版。
 - `third_party/touhou-modern-vita`（GXM 描画）と `third_party/touhou_dls_common`（gm.dls の MIDI 合成器）: MIT。touhou_dls_common は Microsoft のコードを含みません。利用者の gm.dls を読んで鳴らします。
 - 同梱フォント Noto Sans JP: SIL Open Font License 1.1（[licenses/NotoSansJP/](licenses/NotoSansJP/)）。
+- 冴風（Saekaze、旧 Swiizyu）さん — Switch ネイティブ移植（[saekaze/touhou-switch](https://github.com/saekaze/touhou-switch)）。この一連の移植のきっかけになりました。
 - 静的リンクしているライブラリとそのライセンス: [THIRD_PARTY.md](THIRD_PARTY.md)。詳しいクレジット: [CREDITS.md](CREDITS.md)。
 
 This software uses the FreeType Project font engine.
