@@ -1,0 +1,19 @@
+NotoSansJP-Regular.ttf (bundled in the VPK as app0:NotoSansJP-Regular.ttf)
+=======================================================================
+
+Font: Noto Sans CJK JP, Regular, version 2.004
+Copyright 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'.
+License: SIL Open Font License 1.1 (OFL.txt in this directory). The GNU GPL of
+the rest of this project does not apply to the font.
+
+Upstream release: Noto CJK Sans 2.004 (2021-04-28)
+  https://github.com/notofonts/noto-cjk/releases/tag/Sans2.004
+
+File in this repository: assets/NotoSansJP-Regular.ttf
+Size: 4,491,696 bytes
+SHA-256: 6ab1664d8adc20b19237ddc451c94e31f493cb851a1917242debf66f9af6da05
+
+This is the same file as in the TH06/TH08 PSP ports (kan8223-dotcom/th06-psp-native,
+kan8223-dotcom/th08-psp-native): a reduced build of Noto Sans CJK JP 2.004 under
+the file name NotoSansJP-Regular.ttf. Its internal names are the upstream ones;
+the Reserved Font Name "Source" is not used. It is distributed unmodified here.

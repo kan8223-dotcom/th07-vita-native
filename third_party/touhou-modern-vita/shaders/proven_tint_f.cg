@@ -1,0 +1,7 @@
+// Isolated sampler diagnostic. Keep tint a runtime uniform set to (1,1,1,1).
+// A compile-time white constant would collapse to a different F16 query profile.
+float4 main(float2 uv : TEXCOORD0, uniform sampler2D tex0,
+            uniform float4 tint) : COLOR0
+{
+    return tex2D(tex0, uv) * tint;
+}

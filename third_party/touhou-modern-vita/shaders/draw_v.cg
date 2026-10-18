@@ -1,0 +1,12 @@
+void main(float4 position : POSITION, float4 diffuse : COLOR0,
+          float2 uv : TEXCOORD0, float4 specular : COLOR1, float4 fog : TEXCOORD1,
+          out float4 oPosition : POSITION, out float2 oUV : TEXCOORD0,
+          out float4 oDiffuse : TEXCOORD1, out float4 oSpecular : TEXCOORD2,
+          out float4 oFog : TEXCOORD3)
+{
+    oPosition = position;
+    oDiffuse = diffuse;
+    oUV = uv;
+    oSpecular = specular;
+    oFog = fog;
+}

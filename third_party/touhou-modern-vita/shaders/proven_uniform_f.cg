@@ -1,0 +1,5 @@
+// Diagnostic only: same uniform-only operation and parameter name as libvita2d.
+float4 main(uniform float4 uClearColor) : COLOR0
+{
+    return uClearColor;
+}

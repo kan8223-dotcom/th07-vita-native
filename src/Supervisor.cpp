@@ -1,0 +1,1550 @@
+#include "Supervisor.hpp"
+#include "SaveDataEndian.hpp"
+
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_gamecontroller.h>
+#include <SDL2/SDL_timer.h>
+#include <chrono>
+#include <cstdio>
+
+#include "AnmIdx.hpp"
+#include "AnmManager.hpp"
+#include "AsciiManager.hpp"
+#include "Chain.hpp"
+#include "Controller.hpp"
+#include "Ending.hpp"
+#include "FileSystem.hpp"
+#include "GameErrorContext.hpp"
+#include "GameManager.hpp"
+#include "MainMenu.hpp"
+#include "MidiOutput.hpp"
+#include "MusicRoom.hpp"
+#include "ResultScreen.hpp"
+#include "Rng.hpp"
+#include "SoundPlayer.hpp"
+#include "TextHelper.hpp"
+#include "ZunResult.hpp"
+#include "dxutil.hpp"
+#include "graphics/ZunGraphics.hpp"
+#include "pbg4/Pbg4Archive.hpp"
+#if defined(TH07_PSP)
+#include "fileio.hpp"
+#include "graphics/PspGuGraphics.hpp"
+#endif
+
+ControllerMapping g_ControllerMapping = {0, 1, 2, 4, -1, -1, -1, -1, 3};
+
+u16 g_CurFrameRawInput;
+u16 g_CurFrameGameInput;
+u16 g_LastFrameRawInput;
+u16 g_LastFrameGameInput;
+u16 g_IsEighthFrameOfHeldInput;
+u16 g_NumOfFramesInputsWereHeld;
+Supervisor g_Supervisor;
+u32 g_FpsUpdateCounter;
+char g_ReplayFpsBuffer[256];
+char g_FpsCounterBuffer[256];
+u32 g_NumFramesSinceLastTime;
+u64 g_PerformanceCounter;
+
+void Supervisor::DebugPrint(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+}
+
+void Supervisor::CheckTiming()
+{
+    f64 timeDiff;
+    f64 perfDiff;
+
+    if (!this->checkTiming)
+    {
+        return;
+    }
+
+    this->curPerfCounter = SDL_GetPerformanceCounter();
+
+    this->curTime = std::chrono::system_clock::now();
+
+    timeDiff = std::chrono::duration<f64>(this->curTime - this->prevTime).count();
+    perfDiff = (f64)(this->curPerfCounter - this->prevPerfCounter) / (f64)this->perfFrequency;
+
+    if (perfDiff >= 1.0)
+    {
+        if (timeDiff / perfDiff > 2.5)
+        {
+            this->timingErrorCount++;
+            if (this->maxTimingError < this->timingErrorCount)
+            {
+                this->maxTimingError = this->timingErrorCount;
+            }
+            if (this->timingSpikeAccumulator < this->timingErrorCount)
+            {
+                this->timingSpikeAccumulator = this->timingErrorCount;
+            }
+            if (this->timingSpikeAccumulator >= 10)
+            {
+                this->timingBadCount++;
+                this->timingSpikeAccumulator = 0;
+            }
+            Supervisor::DebugPrint("alq チェック %f / %f = %f\n", timeDiff, perfDiff,
+                                   timeDiff / perfDiff);
+        }
+        else if (this->timingErrorCount != 0)
+        {
+            this->timingErrorCount--;
+        }
+        this->checkTiming = 0;
+    }
+
+    if (this->maxTimingError >= 40 || this->timingBadCount >= 16)
+    {
+        this->flags |= 8;
+    }
+    else
+    {
+        this->flags &= 0xfffffff7;
+    }
+}
+
+void AnmManager::ReleaseVertexBuffer()
+{
+}
+
+u32 Supervisor::OnUpdate(Supervisor *arg)
+{
+    g_AnmManager->SetVertexShader(255);
+    g_AnmManager->SetSprite(NULL);
+    g_AnmManager->SetTexture(0);
+    g_AnmManager->SetColorOp(255);
+    g_AnmManager->SetBlendMode(255);
+    g_AnmManager->SetZWriteDisable(255);
+    g_AnmManager->ClearFrameState();
+    g_AnmManager->SetCameraMode(255);
+    g_AnmManager->SetColor(0x80808080);
+    g_AnmManager->offset.y = 0.0f;
+    g_AnmManager->offset.x = 0.0f;
+    g_Supervisor.fogEnabled = 255;
+    if (!g_GameManager.slowModeSlowActive)
+    {
+        g_LastFrameRawInput = g_CurFrameRawInput;
+        g_CurFrameRawInput = Controller::GetInput();
+        g_IsEighthFrameOfHeldInput = 0;
+        if (g_LastFrameRawInput == g_CurFrameRawInput)
+        {
+            if (g_NumOfFramesInputsWereHeld >= 30)
+            {
+                if (g_NumOfFramesInputsWereHeld % 8 == 0)
+                {
+                    g_IsEighthFrameOfHeldInput = 1;
+                }
+                if (g_NumOfFramesInputsWereHeld >= 38)
+                {
+                    g_NumOfFramesInputsWereHeld = 30;
+                }
+            }
+            g_NumOfFramesInputsWereHeld++;
+        }
+        else
+        {
+            g_NumOfFramesInputsWereHeld = 0;
+        }
+    }
+    else
+    {
+        g_CurFrameRawInput |= Controller::GetInput();
+    }
+    if (arg->wantedState != arg->curState)
+    {
+#if defined(TH07_PSP)
+        char message[64];
+        std::snprintf(message, sizeof(message), "scene wanted %d current %d", arg->wantedState,
+                      arg->curState);
+        th07_psp_boot_note(message);
+#endif
+        arg->prevState = arg->wantedState;
+        Supervisor::DebugPrint("scene %d -> %d\n", arg->wantedState, arg->curState);
+        switch (arg->wantedState)
+        {
+        case 0:
+        CASE_0:
+            arg->curState = 1;
+#if defined(TH07_PSP_1000)
+            // TH06's decisive PSP-1000 fix was to retire detached texture
+            // blocks at registration boundaries. Do it before the large
+            // title archive asks libc for one contiguous 5.4 MiB block.
+            {
+                const unsigned int releasedBytes = Th07PspTrimTextureCache();
+                th07_psp_boot_notef("PSP1000 title boundary trim %uK",
+                                    releasedBytes / 1024u);
+            }
+#endif
+            if (MainMenu::RegisterChain() != ZUN_SUCCESS)
+            {
+#if defined(TH07_PSP)
+                th07_psp_boot_note("menu init failed; trim and retry");
+                const unsigned int releasedBytes = Th07PspTrimTextureCache();
+                char retryMessage[80];
+                std::snprintf(retryMessage, sizeof(retryMessage),
+                              "menu retry after trim %uK", releasedBytes / 1024u);
+                th07_psp_boot_note(retryMessage);
+                if (MainMenu::RegisterChain() == ZUN_SUCCESS)
+                {
+                    break;
+                }
+                th07_psp_boot_note("menu retry failed");
+#endif
+                return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+            }
+            break;
+        case 1:
+            switch (arg->curState)
+            {
+            case -1:
+                return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+            case 2:
+#if defined(TH07_PSP_1000)
+                // MainMenu has just released its atlases. Return those cached
+                // blocks now so stage/portrait archives see a coalesced heap.
+                {
+                    const unsigned int releasedBytes = Th07PspTrimTextureCache();
+                    th07_psp_boot_notef("PSP1000 game boundary trim %uK",
+                                        releasedBytes / 1024u);
+                }
+#endif
+                if (GameManager::RegisterChain() != ZUN_SUCCESS)
+                {
+#if defined(TH07_PSP)
+                    // A title attract demo is optional.  The inherited path
+                    // treated any partial demo asset failure as a successful
+                    // application exit, which looks like a forced PSP
+                    // shutdown.  Tear the partial game chain down through its
+                    // normal lifecycle and restore the title instead.
+                    if (g_GameManager.demo)
+                    {
+                        th07_psp_boot_note("demo init failed; return title");
+                        GameManager::CutChain();
+                        arg->prevState = 2;
+                        arg->curState = 0;
+                        goto CASE_0;
+                    }
+#endif
+                    return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+                }
+                break;
+            case 4:
+                return CHAIN_CALLBACK_RESULT_EXIT_GAME_ERROR;
+            case 5:
+                if (ResultScreen::RegisterChain(0) != ZUN_SUCCESS)
+                {
+                    return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+                }
+                break;
+            case 8:
+#if defined(TH07_PSP)
+                th07_psp_boot_note("music chain register");
+#endif
+                if (MusicRoom::RegisterChain() != ZUN_SUCCESS)
+                {
+                    return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+                }
+                break;
+            case 9:
+                GameManager::CutChain();
+                if (Ending::RegisterChain() != ZUN_SUCCESS)
+                {
+                    return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+                }
+                break;
+            }
+            break;
+        case 5:
+            switch (arg->curState)
+            {
+            case -1:
+                return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+            case 1:
+                arg->curState = 0;
+                goto CASE_0;
+            }
+            break;
+        case 2:
+            switch (arg->curState)
+            {
+            case -1:
+                return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+            case 1:
+                GameManager::CutChain();
+                arg->curState = 0;
+                ReplayManager::SaveReplay(NULL, NULL);
+                goto CASE_0;
+                break;
+            case 6:
+                GameManager::CutChain();
+#if defined(TH07_PSP_1000)
+                // ResultScreen expands a 640x480 RGB24 JPEG immediately after
+                // gameplay has released its stage atlases.  The PSP backend
+                // keeps those detached texture blocks in a recycle cache, so
+                // return them to libc before the JPEG needs one large block.
+                {
+                    const unsigned int releasedBytes = Th07PspTrimTextureCache();
+                    th07_psp_boot_notef("PSP1000 result boundary trim %uK",
+                                        releasedBytes / 1024u);
+                }
+#endif
+                if (ResultScreen::RegisterChain(1) != ZUN_SUCCESS)
+                {
+#if defined(TH07_PSP)
+                    // RegisterChain rolls a partially initialized result
+                    // screen back.  Trim once more and retry from a clean
+                    // lifecycle; if memory is still unavailable, preserve the
+                    // running application and return to the title instead of
+                    // reporting a successful process exit to the XMB.
+                    th07_psp_boot_note("result init failed; trim and retry");
+                    {
+                        const unsigned int releasedBytes = Th07PspTrimTextureCache();
+                        th07_psp_boot_notef("result retry after trim %uK",
+                                            releasedBytes / 1024u);
+                    }
+                    if (ResultScreen::RegisterChain(1) == ZUN_SUCCESS)
+                    {
+                        break;
+                    }
+                    th07_psp_boot_note("result retry failed; return title");
+                    if (ResultScreen::RegisterChain(2) != ZUN_SUCCESS)
+                    {
+                        th07_psp_boot_note("result fallback score flush failed");
+                    }
+                    else
+                    {
+                        th07_psp_boot_note("result fallback score flush ready");
+                    }
+                    ReplayManager::SaveReplay(NULL, NULL);
+                    arg->curState = 0;
+                    goto CASE_0;
+#else
+                    return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+#endif
+                }
+                break;
+            case 10:
+                GameManager::CutChain();
+                if (!g_GameManager.practice && g_GameManager.difficulty < 4)
+                {
+                    g_GameManager.currentStage = 0;
+                }
+                else
+                {
+                    g_GameManager.currentStage--;
+                }
+                ReplayManager::SaveReplay(NULL, NULL);
+                if (GameManager::RegisterChain() != ZUN_SUCCESS)
+                {
+                    return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+                }
+                arg->curState = 2;
+                break;
+            case 11:
+                g_Supervisor.curState = 3;
+                GameManager::CutChain();
+                g_GameManager.currentStage--;
+                if (GameManager::RegisterChain() != ZUN_SUCCESS)
+                {
+                    return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+                }
+                arg->curState = 2;
+                break;
+            case 12:
+                g_Supervisor.curState = 3;
+                GameManager::CutChain();
+                if (GameManager::RegisterChain() != ZUN_SUCCESS)
+                {
+                    return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+                }
+                arg->curState = 2;
+                break;
+            case 3:
+            {
+                const i32 completedStage = g_GameManager.currentStage;
+                GameManager::CutChain();
+#if defined(TH07_PSP)
+                // Do this before registration, not only after an allocation
+                // has already failed: stage 4 and 5 leave several differently
+                // sized atlas blocks behind, while stage 6 immediately needs
+                // another large set.  Returning the unused blocks lets libc
+                // coalesce them before any stage 6 parser/texture allocation.
+                const unsigned int boundaryReleasedBytes = Th07PspTrimTextureCache();
+                char boundaryMessage[96];
+                std::snprintf(boundaryMessage, sizeof(boundaryMessage),
+                              "stage boundary cache trimmed %uK before stage %d",
+                              boundaryReleasedBytes / 1024u, completedStage + 1);
+                th07_psp_boot_note(boundaryMessage);
+#endif
+                if (GameManager::RegisterChain() != ZUN_SUCCESS)
+                {
+#if defined(TH07_PSP)
+                    // A real PSP can reach this boundary with the heap split
+                    // among cached texture blocks after the large stage 4/5
+                    // atlases.  The original control flow reported a normal
+                    // application exit, so clearing stage 5 looked like an
+                    // unexplained return to XMB.  Dispose the partial stage 6
+                    // chain, release only unused backend blocks, then retry
+                    // the exact same stage once from a clean heap.
+                    th07_psp_boot_note("next stage init failed; trim texture cache");
+                    GameManager::CutChain();
+                    g_GameManager.currentStage = completedStage;
+                    const unsigned int releasedBytes = Th07PspTrimTextureCache();
+                    char message[96];
+                    std::snprintf(message, sizeof(message),
+                                  "texture cache trimmed %uK; retry stage %d",
+                                  releasedBytes / 1024u, completedStage + 1);
+                    th07_psp_boot_note(message);
+                    if (GameManager::RegisterChain() != ZUN_SUCCESS)
+                    {
+                        th07_psp_boot_note("next stage retry failed; return title");
+                        // Transition state preserves common gameplay ANMs.
+                        // Switch state before teardown so the failure fallback
+                        // releases them and leaves enough memory for the title.
+                        arg->curState = 1;
+                        GameManager::CutChain();
+                        g_GameManager.currentStage = completedStage;
+                        arg->prevState = 2;
+                        arg->curState = 0;
+                        g_GameManager.demo = 0;
+                        goto CASE_0;
+                    }
+#else
+                    return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+#endif
+                }
+                arg->curState = 2;
+                break;
+            }
+            case 7:
+            {
+#if defined(TH07_PSP)
+                th07_psp_boot_note("replay return begin");
+#endif
+                GameManager::CutChain();
+                arg->curState = 0;
+                ReplayManager::SaveReplay(NULL, NULL);
+                arg->curState = 1;
+#if defined(TH07_PSP)
+                // A completed replay returns through a separate state from the
+                // normal gameplay-to-title path, so it previously skipped the
+                // texture-cache trim and retry used at other PSP registration
+                // boundaries.  Retire detached stage blocks before title01.anm
+                // asks the fragmented heap for its large contiguous source.
+                {
+                    const unsigned int releasedBytes = Th07PspTrimTextureCache();
+                    th07_psp_boot_notef("replay return boundary trim %uK",
+                                        releasedBytes / 1024u);
+                }
+#endif
+                if (MainMenu::RegisterChain() != ZUN_SUCCESS)
+                {
+#if defined(TH07_PSP)
+                    // RegisterChain rolls its partial menu lifecycle back, so
+                    // one trim-and-retry is safe.  If replay selection still
+                    // cannot be restored, clear replay mode and use the normal
+                    // title fallback instead of reporting success to the XMB.
+                    th07_psp_boot_note("replay return menu failed; trim and retry");
+                    {
+                        const unsigned int releasedBytes = Th07PspTrimTextureCache();
+                        th07_psp_boot_notef("replay return retry after trim %uK",
+                                            releasedBytes / 1024u);
+                    }
+                    if (MainMenu::RegisterChain() == ZUN_SUCCESS)
+                    {
+                        th07_psp_boot_note("replay return menu ready after retry");
+                        break;
+                    }
+
+                    th07_psp_boot_note("replay return retry failed; return title");
+                    g_GameManager.SetReplay(0);
+                    g_GameManager.demo = 0;
+                    arg->prevState = 2;
+                    arg->curState = 0;
+                    goto CASE_0;
+#else
+                    return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+#endif
+                }
+#if defined(TH07_PSP)
+                th07_psp_boot_note("replay return menu ready");
+#endif
+                break;
+            }
+            case 9:
+                g_GameManager.plst.playDataByDifficulty[g_GameManager.difficulty]
+                    .noContinueClearCount =
+                    g_GameManager.plst.playDataByDifficulty[g_GameManager.difficulty]
+                        .noContinueClearCount +
+                    1;
+                GameManager::CutChain();
+                if (Ending::RegisterChain() != ZUN_SUCCESS)
+                {
+                    return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+                }
+                break;
+            }
+            break;
+        case 6:
+            switch (arg->curState)
+            {
+            case -1:
+                ReplayManager::SaveReplay(NULL, NULL);
+                return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+            case 1:
+                arg->curState = 0;
+                ReplayManager::SaveReplay(NULL, NULL);
+                goto CASE_0;
+            }
+            break;
+        case 8:
+            switch (arg->curState)
+            {
+            case -1:
+                return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+            case 1:
+                arg->curState = 0;
+                goto CASE_0;
+            }
+            break;
+        case 9:
+            switch (arg->curState)
+            {
+            case -1:
+                return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+            case 1:
+                arg->curState = 0;
+                goto CASE_0;
+            case 6:
+                if (ResultScreen::RegisterChain(1) != ZUN_SUCCESS)
+                {
+                    return CHAIN_CALLBACK_RESULT_EXIT_GAME_SUCCESS;
+                }
+                break;
+            }
+            break;
+        }
+        g_CurFrameRawInput = g_LastFrameRawInput = g_IsEighthFrameOfHeldInput = 0;
+    }
+    arg->wantedState = arg->curState;
+    arg->calcCount = arg->calcCount + 1;
+
+    return CHAIN_CALLBACK_RESULT_CONTINUE;
+}
+
+u32 Supervisor::OnDraw(Supervisor *arg)
+{
+    (void)arg;
+
+    DrawFpsCounter(1);
+    return CHAIN_CALLBACK_RESULT_CONTINUE;
+}
+
+ZunResult Supervisor::SetupInput()
+{
+    if (this->cfg.disableDinput)
+    {
+        return ZUN_ERROR;
+    }
+
+    if (SDL_Init(SDL_INIT_GAMECONTROLLER) == 0)
+    {
+        g_Supervisor.controller = SDL_GameControllerOpen(0);
+        if (g_Supervisor.controller)
+        {
+            g_GameErrorContext.Log("有効なパッドを発見しました\n");
+        }
+    }
+
+    return ZUN_SUCCESS;
+}
+
+ZunResult Supervisor::LoadGameData()
+{
+    char verFile[128];
+    if (g_Pbg4Archive.Load("th07.dat"))
+    {
+        sprintf(verFile, "th07_%.4x%c.ver", 256, 98);
+        g_Supervisor.version = (char *)FileSystem::OpenFile(verFile, 0);
+        g_Supervisor.versionTableSize = g_LastFileSize;
+        if (!g_Supervisor.version)
+        {
+            g_GameErrorContext.Fatal("error : データのバージョンが違います\n");
+            return ZUN_ERROR;
+        }
+    }
+    else
+    {
+        g_GameErrorContext.Fatal("error : データファイルが存在しません\n");
+        return ZUN_ERROR;
+    }
+    return ZUN_SUCCESS;
+}
+
+i32 Supervisor::CheckVSync()
+{
+#if defined(TH07_PSP) || defined(TH07_VITA)
+    // Both native backends present on vblank (Vita uses its own ARM/GXM
+    // implementation). The PC timing probe has no useful result here.
+    for (i32 i = 0; i < 4; ++i)
+    {
+        g_AnmManager->CopySurfaceToBackBuffer(0, 0, 0, 0, 0);
+        g_Supervisor.gfxDevice->SwapBuffers();
+    }
+    g_Supervisor.vsyncEnabled = 1;
+    return 0;
+#else
+    f32 fpsSum;
+    i32 j;
+    f32 fps;
+    i32 timeDiff;
+    u64 timeEnd;
+    i32 fpsCount;
+    f32 fpsArray[29];
+    u64 timeStart;
+    i32 frameCount;
+    i32 i;
+
+    i = 0;
+    frameCount = 0;
+    fpsCount = 0;
+    timeStart = 0;
+
+    timeStart = SDL_GetTicks64();
+
+    while (i < 1800 && fpsCount < 8)
+    {
+        g_AnmManager->CopySurfaceToBackBuffer(0, 0, 0, 0, 0);
+        g_Supervisor.gfxDevice->SwapBuffers();
+        i++;
+        timeEnd = SDL_GetTicks64();
+        frameCount++;
+        timeDiff = timeEnd - timeStart;
+
+        if (timeDiff >= 700)
+        {
+            timeStart = timeEnd;
+            frameCount = 0;
+        }
+        else if (timeDiff >= 500)
+        {
+            fps = frameCount * 1000.0f / (f32)timeDiff;
+            if (fps >= 57.0f)
+            {
+                fpsArray[fpsCount] = fps;
+                fpsCount++;
+            }
+            timeStart = timeEnd;
+            frameCount = 0;
+        }
+    }
+
+    if (!g_Supervisor.cfg.enableVsync)
+    {
+        fpsSum = 0.0f;
+        if (fpsCount >= 2)
+        {
+            for (j = 0; j < fpsCount; j++)
+            {
+                fpsSum += fpsArray[j];
+            }
+            fpsSum /= (f32)j;
+        }
+        else
+        {
+            fpsSum = 1000.0f;
+        }
+
+        if (g_Supervisor.gfxDevice->GetType() == RENDERER_SOFTWARE)
+        {
+            return 0;
+        }
+
+        if (fpsSum > 160.0f)
+        {
+            g_GameErrorContext.Log("垂直同期が取れてないか、リフレッシュレートが高すぎます\n");
+            g_GameErrorContext.Log("強制６０フレームモードで動作します\n");
+            g_Supervisor.vsyncEnabled = 1;
+        }
+        else if (fpsSum >= 65.0f)
+        {
+            g_GameErrorContext.Log("垂直同期が取れてないか、リフレッシュレートが高すぎます。\n");
+            g_GameErrorContext.Log("強制６０フレームモードで動作します\n");
+            g_Supervisor.vsyncEnabled = 1;
+            return -2;
+        }
+    }
+    return 0;
+#endif
+}
+
+ZunResult Supervisor::AddedCallback(Supervisor *arg)
+{
+    ScoreDat *scoreDat;
+    i32 i;
+
+    arg->perfFrequency = SDL_GetPerformanceFrequency();
+    g_Supervisor.gfxDevice->SetClearColor({0xff000000});
+    g_Supervisor.gfxDevice->Clear(CLEAR_COLOR_BUFFER);
+    g_Supervisor.gfxDevice->SwapBuffers();
+    g_Supervisor.gfxDevice->Clear(CLEAR_COLOR_BUFFER);
+    g_Supervisor.gfxDevice->SwapBuffers();
+    if (LoadGameData() != ZUN_SUCCESS)
+    {
+        return ZUN_ERROR;
+    }
+    g_AnmManager->LoadSurface(0, "data/title/th07logo.jpg");
+    g_Supervisor.isInEnding = 1;
+    if (!g_Supervisor.vsyncEnabled)
+    {
+        if (CheckVSync())
+        {
+            g_AnmManager->ReleaseSurface(0);
+            return (ZunResult)-2;
+        }
+    }
+    else
+    {
+        i = 0;
+        while (i < 4)
+        {
+            g_AnmManager->CopySurfaceToBackBuffer(0, 0, 0, 0, 0);
+            g_Supervisor.gfxDevice->SwapBuffers();
+            i++;
+        }
+    }
+    g_AnmManager->ReleaseSurface(0);
+    arg->isInEnding = 0;
+    arg->renderSkipFrames = 0;
+    arg->lastTotalPlayTimeUpdate = SDL_GetTicks64();
+    g_Rng.SetSeed(arg->lastTotalPlayTimeUpdate);
+#if defined(TH07_STATE_TRACE)
+    // Comparison builds only: remove the wall-clock seed on BOTH platforms.
+    g_Rng = Rng{0x1234,0,0};
+#endif
+    arg->SetupInput();
+    if (!arg->midiOutput)
+    {
+        arg->midiOutput = new MidiOutput;
+    }
+    if (arg->midiOutput)
+    {
+        arg->midiOutput->ReadFileData(30, "bgm/init.mid");
+    }
+#if defined(TH07_PSP_MECC_AUDIO_4M)
+    if (g_SoundPlayer.InitSoundBuffers() != ZUN_SUCCESS)
+    {
+        th07_psp_boot_note("MECC AUDIO4M SFX initialization failed");
+        return ZUN_ERROR;
+    }
+#else
+    g_SoundPlayer.InitSoundBuffers();
+#endif
+    if (g_AnmManager->LoadAnms(ANM_FILE_TEXT, "data/text.anm", ANM_OFFSET_TEXT) != ZUN_SUCCESS)
+    {
+        return ZUN_ERROR;
+    }
+
+    if (AsciiManager::RegisterChain() != ZUN_SUCCESS)
+    {
+        g_GameErrorContext.Log("error : 文字の初期化に失敗しました\n");
+        return ZUN_ERROR;
+    }
+
+    g_AnmManager->SetupVertexBuffer();
+    if (TextHelper::CreateTextBuffer() != ZUN_SUCCESS)
+    {
+        return ZUN_ERROR;
+    }
+    if (g_SoundPlayer.LoadFmt("bgm/thbgm.fmt"))
+    {
+        g_GameErrorContext.Log("error : BGM の初期化に失敗しました\n");
+        return ZUN_ERROR;
+    }
+
+    if (g_SoundPlayer.bgmSeekOffset == 0)
+    {
+        if (!g_Supervisor.cfg.preloadBgm)
+        {
+            g_SoundPlayer.StartBGM("thbgm.dat");
+        }
+        else
+        {
+            memcpy(g_SoundPlayer.bgmArchivePath, "thbgm.dat", 10);
+        }
+    }
+    else if (!g_Supervisor.cfg.preloadBgm)
+    {
+        g_SoundPlayer.StartBGM("th07.dat");
+    }
+    else
+    {
+        memcpy(g_SoundPlayer.bgmArchivePath, "th07.dat", 9);
+    }
+    scoreDat = ResultScreen::OpenScore("score.dat");
+    memset(&g_GameManager.plst, 0, sizeof(g_GameManager.plst));
+    g_GameManager.plst.base.th7kLen2 = g_GameManager.plst.base.th7kLen = sizeof(Plst);
+    g_GameManager.plst.base.magic = PLST_MAGIC;
+    g_GameManager.plst.base.version = 1;
+    ResultScreen::ParsePlst(scoreDat, &g_GameManager.plst);
+    ResultScreen::ReleaseScoreDat(scoreDat);
+    g_Supervisor.midiTimer = new DummyMidiTimer;
+    if (g_Supervisor.midiTimer)
+    {
+        g_Supervisor.midiTimer->StartTimerDefault();
+    }
+    return ZUN_SUCCESS;
+}
+
+ZunResult Supervisor::DeletedCallback(Supervisor *arg)
+{
+    SAFE_FREE(g_Supervisor.version);
+    g_AnmManager->ReleaseVertexBuffer();
+    g_AnmManager->ReleaseAnm(0);
+    AsciiManager::CutChain();
+    g_SoundPlayer.PushCommand(AUDIO_SHUTDOWN, 0, "dummy");
+    if (arg->midiOutput)
+    {
+        arg->midiOutput->StopPlayback();
+        delete arg->midiOutput;
+        arg->midiOutput = NULL;
+    }
+    ReplayManager::SaveReplay(NULL, NULL);
+    TextHelper::ReleaseTextBuffer();
+    if (arg->controller)
+    {
+        SDL_GameControllerClose(arg->controller);
+    }
+    SAFE_DELETE(g_GameManager.globals);
+    SAFE_DELETE(g_GameManager.defaultCfg);
+    g_Pbg4Archive.Release();
+    if (g_Supervisor.midiTimer)
+    {
+        StopMidiTimer(g_Supervisor.midiTimer);
+        delete g_Supervisor.midiTimer;
+        g_Supervisor.midiTimer = NULL;
+    }
+    return ZUN_SUCCESS;
+}
+
+ZunResult Supervisor::RegisterChain()
+{
+    ZunResult res;
+
+    Supervisor *mgr = &g_Supervisor;
+#if defined(TH07_PSP_DIRECT_MUSIC)
+    // Deterministic profiler route for the music room.  Start through the
+    // regular title allocation/teardown path so the room sees the same heap
+    // layout as a physical title -> Music Room transition.  MainMenu performs
+    // the guarded automatic selection once its title VMs are ready.
+    mgr->wantedState = 0;
+    mgr->curState = -1;
+    th07_psp_boot_note("direct music room via title");
+#elif defined(TH07_PSP_DIRECT_GAME)
+#if !defined(TH07_PSP_DIRECT_STAGE)
+#define TH07_PSP_DIRECT_STAGE 3
+#endif
+    // Gameplay bring-up route: reproduce the normal menu result without
+    // manual selection.  As with the Music Room profiler route, start through
+    // the real title allocation/teardown path; MainMenu performs the guarded
+    // automatic transition after its VMs are ready.
+    g_GameManager.practice = 0;
+    g_GameManager.demo = 0;
+    g_GameManager.character = CHAR_REIMU;
+    g_GameManager.shotType = 0;
+    static_assert(TH07_PSP_DIRECT_STAGE >= 1 && TH07_PSP_DIRECT_STAGE <= 8,
+                  "TH07_PSP_DIRECT_STAGE must be in the range 1..8");
+    g_GameManager.currentStage = TH07_PSP_DIRECT_STAGE - 1;
+    g_GameManager.difficulty = DIFF_NORMAL;
+    g_GameManager.SetReplay(0);
+    mgr->wantedState = 0;
+    mgr->curState = -1;
+    {
+        char message[64];
+        std::snprintf(message, sizeof(message), "direct game via title normal reimu-a stage %d",
+                      TH07_PSP_DIRECT_STAGE);
+        th07_psp_boot_note(message);
+    }
+#else
+    mgr->wantedState = 0;
+    mgr->curState = -1;
+#endif
+    mgr->calcCount = 0;
+    ChainElem *chain = g_Chain.CreateElem((ChainCallback)OnUpdate);
+    chain->arg = mgr;
+    chain->addedCallback = (ChainLifecycleCallback)AddedCallback;
+    chain->deletedCallback = (ChainLifecycleCallback)DeletedCallback;
+    res = g_Chain.AddToCalcChain(chain, 0);
+    if (res)
+    {
+        return res;
+    }
+
+    chain = g_Chain.CreateElem((ChainCallback)OnDraw);
+    chain->arg = mgr;
+    g_Chain.AddToDrawChain(chain, 15);
+    return ZUN_SUCCESS;
+}
+
+void Supervisor::DrawFpsCounter(i32 param_1)
+{
+    ZunVec3 local_30;
+    ZunVec3 local_24;
+    u64 local_18;
+    f32 targetFps;
+    u64 curTime;
+    f32 elapsedTimeInSecs;
+    f32 fps;
+
+    if (!g_GameManager.slowModeSlowActive)
+    {
+        g_NumFramesSinceLastTime += 1 + (u32)g_Supervisor.cfg.frameskipConfig;
+
+        if (g_Supervisor.perfFrequency == 0)
+        {
+            static u64 g_LastTime = SDL_GetTicks64();
+
+            curTime = SDL_GetTicks64();
+            if (curTime < g_LastTime)
+            {
+                g_LastTime = curTime;
+                g_NumFramesSinceLastTime = 0;
+            }
+            if (curTime - g_LastTime >= 500)
+            {
+                elapsedTimeInSecs = (f32)(curTime - g_LastTime) / 1000.0f;
+                g_LastTime = curTime;
+
+            MERGE:
+                fps = (f32)g_NumFramesSinceLastTime / elapsedTimeInSecs;
+                g_NumFramesSinceLastTime = 0;
+                sprintf(g_FpsCounterBuffer, "%.02ffps", (f64)fps);
+                if (g_GameManager.notInMenu && param_1 != 0)
+                {
+                    targetFps = 60.0f;
+                    g_Supervisor.fpsAccumulator = g_Supervisor.fpsAccumulator + targetFps;
+                    if (targetFps * 0.9f < fps)
+                    {
+                        g_Supervisor.framerateMultiplier =
+                            g_Supervisor.framerateMultiplier + targetFps;
+                    }
+                    else if (targetFps * 0.7f < fps)
+                    {
+                        g_Supervisor.framerateMultiplier =
+                            g_Supervisor.framerateMultiplier + targetFps * 0.8f;
+                    }
+                    else if (targetFps * 0.5f < fps)
+                    {
+                        g_Supervisor.framerateMultiplier =
+                            g_Supervisor.framerateMultiplier + targetFps * 0.6f;
+                    }
+                    else
+                    {
+                        g_Supervisor.framerateMultiplier =
+                            g_Supervisor.framerateMultiplier + targetFps * 0.5f;
+                    }
+
+                    if (!g_GameManager.replay)
+                    {
+                        g_Supervisor.curFps = fps + 0.5f;
+                    }
+                    else
+                    {
+                        sprintf(g_ReplayFpsBuffer, "%2d", (i32)g_Supervisor.curFps);
+                    }
+                }
+            }
+            goto LAB_00439350;
+        }
+
+        if (g_PerformanceCounter == 0)
+        {
+            g_PerformanceCounter = SDL_GetPerformanceCounter();
+        }
+        local_18 = SDL_GetPerformanceCounter();
+        if (local_18 < g_PerformanceCounter)
+        {
+            g_PerformanceCounter = local_18;
+            g_NumFramesSinceLastTime = 0;
+        }
+        if (local_18 - g_PerformanceCounter >= g_Supervisor.perfFrequency / 2)
+        {
+            elapsedTimeInSecs =
+                (f32)(local_18 - g_PerformanceCounter) / (f32)g_Supervisor.perfFrequency;
+            g_PerformanceCounter = local_18;
+            g_FpsUpdateCounter++;
+            if (g_FpsUpdateCounter % 8 == 0)
+            {
+                g_Supervisor.CheckTiming();
+            }
+            goto MERGE;
+        }
+    }
+
+LAB_00439350:
+    if (!g_Supervisor.isInEnding && param_1 != 0)
+    {
+        local_24.x = 512.0f;
+        local_24.y = 464.0f;
+        local_24.z = 0.0f;
+        g_AsciiManager.AddString(&local_24, g_FpsCounterBuffer);
+        if (g_GameManager.replay && g_GameManager.notInMenu)
+        {
+            local_30.x = 384.0f;
+            local_30.y = 448.0f;
+            local_30.z = 0.0f;
+            if (g_Supervisor.isFpsBad)
+            {
+                g_AsciiManager.color = 0xffff4040;
+            }
+            else
+            {
+                g_AsciiManager.color = 0xffffffd0;
+            }
+            g_AsciiManager.AddString(&local_30, g_ReplayFpsBuffer);
+            g_AsciiManager.color = 0xffffffff;
+        }
+    }
+}
+
+void ZunTimer::Increment(i32 value)
+{
+    if ((g_Supervisor.flags >> 5 & 1) != 0)
+    {
+        this->current++;
+        this->subFrame = 0.0f;
+        this->previous = -999;
+    }
+    if (g_Supervisor.effectiveFramerateMultiplier > 0.99f)
+    {
+        this->current = this->current + value;
+    }
+    else
+    {
+        if (value < 0)
+        {
+            Decrement(-value);
+        }
+        else
+        {
+            this->previous = this->current;
+            this->subFrame =
+                (f32)value * g_Supervisor.effectiveFramerateMultiplier + this->subFrame;
+            while (this->subFrame >= 1.0f)
+            {
+                this->current = this->current + 1;
+                this->subFrame = this->subFrame - 1.0f;
+            }
+        }
+    }
+}
+
+void ZunTimer::Decrement(i32 value)
+{
+    if ((g_Supervisor.flags >> 5 & 1) != 0)
+    {
+        this->current--;
+        this->subFrame = 0.0f;
+        this->previous = -999;
+    }
+    if (g_Supervisor.effectiveFramerateMultiplier > 0.99f)
+    {
+        this->current = this->current - value;
+    }
+    else
+    {
+        if (value < 0)
+        {
+            Increment(-value);
+        }
+        else
+        {
+            this->previous = this->current;
+            this->subFrame =
+                this->subFrame - (f32)value * g_Supervisor.effectiveFramerateMultiplier;
+            while (this->subFrame < 0.0f)
+            {
+                this->current--;
+                this->subFrame = this->subFrame + 1.0f;
+            }
+        }
+    }
+}
+
+void Supervisor::TickTimer(i32 *frames, f32 *subframes)
+{
+    if (this->effectiveFramerateMultiplier <= 0.99f)
+    {
+        *subframes = *subframes + this->effectiveFramerateMultiplier;
+        if (*subframes >= 1.0f)
+        {
+            *frames = *frames + 1;
+            *subframes = *subframes - 1.0f;
+        }
+    }
+    else
+    {
+        *frames = *frames + 1;
+    }
+}
+
+// ZUN name: snapShotScreen
+i32 Supervisor::SnapshotScreen(const char *param_1)
+{
+    u8 *pixels = new u8[640 * 480 * 4];
+    this->gfxDevice->ReadPixels(0, 0, 640, 480, pixels);
+
+    SDL_Surface *surf =
+        SDL_CreateRGBSurfaceWithFormatFrom(pixels, 640, 480, 32, 640 * 4, SDL_PIXELFORMAT_RGBA32);
+
+    SDL_SaveBMP(surf, param_1);
+    SDL_FreeSurface(surf);
+    delete[] pixels;
+    return 0;
+}
+
+i32 Supervisor::WriteConfig(const char *filename) const
+{
+    GameConfiguration diskConfig = this->cfg;
+    SaveDataEndian::Config(&diskConfig);
+    return FileSystem::WriteDataToFile(filename, &diskConfig, sizeof(diskConfig));
+}
+
+ZunResult Supervisor::LoadConfig(const char *configFilename)
+{
+    i32 bgmData[4];
+    FILE *bgm;
+    i32 bgm2Data[4];
+    FILE *bgm2;
+    u32 *configFile;
+#if defined(TH07_PSP)
+    char resolvedBgmPath[768];
+    const char *bgmPath =
+        th07_psp_resolve_path("thbgm.dat", resolvedBgmPath, sizeof(resolvedBgmPath));
+#else
+    const char *bgmPath = "./thbgm.dat";
+#endif
+
+    memset(&g_Supervisor.cfg, 0, sizeof(GameConfiguration));
+    configFile = (u32 *)FileSystem::OpenFile((char *)configFilename, 1);
+    if (configFile && g_LastFileSize != sizeof(GameConfiguration))
+    {
+        free(configFile);
+        configFile = nullptr;
+    }
+    if (!configFile)
+    {
+        g_GameErrorContext.Log("コンフィグデータが見つからないので初期化しました\n");
+    init:
+        g_Supervisor.cfg.lifeCount = 2;
+        g_Supervisor.cfg.bombCount = 3;
+        g_Supervisor.cfg.colorMode16bit = 255;
+        g_Supervisor.cfg.version = 0x70002;
+        g_Supervisor.cfg.padAxisX = 600;
+        g_Supervisor.cfg.padAxisY = 600;
+        bgm2 = fopen(bgmPath, "rb");
+        if (bgm2)
+        {
+            fread(bgm2Data, 16, 1, bgm2);
+            fclose(bgm2);
+            if (ZunEndian::Read32(&bgm2Data[0]) != 0x5641575a ||
+                ZunEndian::Read32(&bgm2Data[1]) != 1 || ZunEndian::Read32(&bgm2Data[2]) != 0x700)
+            {
+                g_GameErrorContext.Fatal("BGM データのバージョンが違います\n");
+                return ZUN_ERROR;
+            }
+            g_Supervisor.cfg.musicMode = MUSIC_WAV;
+        }
+        else
+        {
+            g_Supervisor.cfg.musicMode = MUSIC_MIDI;
+            Supervisor::DebugPrint("wave データが無いので、midi にします\n");
+        }
+        g_Supervisor.cfg.playSounds = 1;
+        g_Supervisor.cfg.defaultDifficulty = (u8)DIFF_NORMAL;
+        g_Supervisor.cfg.windowed = 0;
+        g_Supervisor.cfg.frameskipConfig = 0;
+        g_Supervisor.cfg.controllerMapping = g_ControllerMapping;
+        g_Supervisor.cfg.effectQuality = QUALITY_BEAUTIFUL;
+        g_Supervisor.cfg.slowMode = 0;
+        g_Supervisor.cfg.shotSlow = 1;
+    }
+    else
+    {
+        g_Supervisor.cfg = *(GameConfiguration *)configFile;
+        SaveDataEndian::Config(&g_Supervisor.cfg);
+        free(configFile);
+
+        bgm = fopen(bgmPath, "rb");
+        if (bgm)
+        {
+            fread(bgmData, 16, 1, bgm);
+            fclose(bgm);
+            if (ZunEndian::Read32(&bgmData[0]) != 0x5641575a ||
+                ZunEndian::Read32(&bgmData[1]) != 1 || ZunEndian::Read32(&bgmData[2]) != 0x700)
+            {
+                g_GameErrorContext.Fatal("BGM データのバージョンが違います\n");
+                return ZUN_ERROR;
+            }
+        }
+        if (!(g_Supervisor.cfg.lifeCount < 5 && g_Supervisor.cfg.bombCount < 4 &&
+              g_Supervisor.cfg.colorMode16bit < 2 && g_Supervisor.cfg.musicMode < 3 &&
+              g_Supervisor.cfg.defaultDifficulty < 6 && g_Supervisor.cfg.playSounds < 2 &&
+              g_Supervisor.cfg.windowed < 2 && g_Supervisor.cfg.frameskipConfig < 3 &&
+              g_Supervisor.cfg.effectQuality < 3 && g_Supervisor.cfg.slowMode < 2 &&
+              g_Supervisor.cfg.shotSlow < 2 && g_Supervisor.cfg.version == 0x70002 &&
+              g_LastFileSize == sizeof(GameConfiguration)))
+        {
+            g_GameErrorContext.Log("コンフィグデータが異常でしたので再初期化しました\n");
+            goto init;
+        }
+        g_ControllerMapping = g_Supervisor.cfg.controllerMapping;
+    }
+    g_Supervisor.cfg.loaded = 1;
+#if defined(TH07_PSP)
+    // PSP has no MIDI synthesizer. Prefer the original PCM archive whenever
+    // it is installed, and always stream it instead of allocating a whole
+    // track in the game's already-tight heap.
+    g_Supervisor.cfg.musicMode =
+        FileSystem::CheckFileExists("thbgm.dat") ? MUSIC_WAV : MUSIC_OFF;
+    g_Supervisor.cfg.preloadBgm = 0;
+#endif
+    if (this->cfg.noVertexBuffers)
+    {
+        g_GameErrorContext.Log("頂点バッファの使用を抑制します\n");
+    }
+    if (this->cfg.disableFog)
+    {
+        g_GameErrorContext.Log("フォグの使用を抑制します\n");
+    }
+    if (this->cfg.use16BitTextures)
+    {
+        g_GameErrorContext.Log("16Bit のテクスチャの使用を強制します\n");
+    }
+    if (this->IsClearingBackbuffer())
+    {
+        g_GameErrorContext.Log("バックバッファの消去を強制します\n");
+    }
+    if (this->cfg.disableItemDrawAroundPlayfield)
+    {
+        g_GameErrorContext.Log("ゲーム周りのアイテムの描画を抑制します\n");
+    }
+    if (this->cfg.disableGouraud)
+    {
+        g_GameErrorContext.Log("グーローシェーディングを抑制します\n");
+    }
+    if (this->cfg.disableZBuffer)
+    {
+        g_GameErrorContext.Log("デプステストを抑制します\n");
+    }
+    this->vsyncEnabled = 0;
+    this->cfg.unused = 0;
+    if (this->cfg.disableTextureBlend)
+    {
+        g_GameErrorContext.Log("テクスチャの色合成を抑制しますn");
+    }
+    if (this->cfg.windowed)
+    {
+        g_GameErrorContext.Log("ウィンドウモードで起動します\n");
+    }
+    if (this->cfg.forceReferenceRender)
+    {
+        g_GameErrorContext.Log("リファレンスラスタライザを強制します\n");
+    }
+    if (this->cfg.disableDinput)
+    {
+        g_GameErrorContext.Log("パッド、キーボードの入力に DirectInput を使用しません\n");
+    }
+
+    this->cfg.redrawEveryFrame = 1;
+    if (this->cfg.redrawEveryFrame)
+    {
+        g_GameErrorContext.Log("画面周りを毎回描画します\n");
+    }
+    if (this->cfg.preloadBgm)
+    {
+        g_GameErrorContext.Log("ＢＧＭをメモリに読み込みます\n");
+    }
+    if (this->cfg.enableVsync)
+    {
+        g_GameErrorContext.Log("垂直同期を取りません\n");
+        g_Supervisor.vsyncEnabled = 1;
+    }
+    if (g_Supervisor.WriteConfig(configFilename))
+    {
+        g_GameErrorContext.Fatal("ファイルが書き出せません %s\n", configFilename);
+        g_GameErrorContext.Fatal("フォルダが書込み禁止属性になっているか、ディスクがいっぱいいっぱ"
+                                 "いになってませんか？\n");
+        return ZUN_ERROR;
+    }
+
+    return ZUN_SUCCESS;
+}
+
+i32 Supervisor::LoadAudio(i32 idx, const char *path)
+{
+    char pathbuf[256];
+    char *pathext;
+
+    if (EffectiveMusicMode() == MUSIC_MIDI)
+    {
+        if (g_Supervisor.midiOutput)
+        {
+            g_Supervisor.midiOutput->ReadFileData(idx, path);
+        }
+        return 0;
+    }
+    else
+    {
+        if (EffectiveMusicMode() == MUSIC_WAV)
+        {
+            strcpy(pathbuf, path);
+
+            pathext = strrchr(pathbuf, '.');
+            if (!pathext)
+            {
+                return 1;
+            }
+
+            pathext[1] = 'w';
+            pathext[2] = 'a';
+            pathext[3] = 'v';
+            g_SoundPlayer.PushCommand(AUDIO_PRELOAD, idx, pathbuf);
+        }
+        return 1;
+    }
+}
+
+ZunResult Supervisor::PlayLoadedAudio(i32 idx)
+{
+    if (EffectiveMusicMode() == MUSIC_MIDI)
+    {
+        if (g_Supervisor.midiOutput)
+        {
+            g_Supervisor.midiOutput->PlayLoaded(idx);
+        }
+        return ZUN_SUCCESS;
+    }
+    if (EffectiveMusicMode() == MUSIC_WAV)
+    {
+        if (g_Supervisor.cfg.preloadBgm)
+        {
+            g_SoundPlayer.PushCommand(AUDIO_SHUTDOWN, 0, "dummy");
+        }
+        g_SoundPlayer.PushCommand(AUDIO_START, idx, "dummy");
+    }
+    return ZUN_SUCCESS;
+}
+
+ZunResult Supervisor::PlayAudio(const char *path)
+{
+    char local_10c[256];
+    char *local_8;
+
+    if (EffectiveMusicMode() == MUSIC_MIDI)
+    {
+        if (g_Supervisor.midiOutput)
+        {
+            g_Supervisor.midiOutput->Play(path);
+        }
+    }
+    else
+    {
+        if (EffectiveMusicMode() == MUSIC_WAV)
+        {
+            strcpy(local_10c, path);
+            local_8 = strrchr(local_10c, '.');
+            if (!local_8)
+            {
+                return ZUN_ERROR;
+            }
+
+            local_8[1] = 'w';
+            local_8[2] = 'a';
+            local_8[3] = 'v';
+            g_SoundPlayer.PushCommand(AUDIO_START, -1, local_10c);
+        }
+        else
+        {
+            return ZUN_ERROR;
+        }
+    }
+    return ZUN_SUCCESS;
+}
+
+ZunResult Supervisor::StopAudio()
+{
+    if (EffectiveMusicMode() == MUSIC_MIDI)
+    {
+        if (g_Supervisor.midiOutput)
+        {
+            g_Supervisor.midiOutput->StopPlayback();
+        }
+    }
+    else
+    {
+        if (EffectiveMusicMode() == MUSIC_WAV)
+        {
+            if (g_Supervisor.cfg.preloadBgm)
+            {
+                g_SoundPlayer.PushCommand(AUDIO_SHUTDOWN, 0, "dummy");
+            }
+            else
+            {
+                g_SoundPlayer.PushCommand(AUDIO_STOP, 0, "dummy");
+            }
+        }
+        else
+        {
+            return ZUN_ERROR;
+        }
+    }
+    return ZUN_SUCCESS;
+}
+
+i32 Supervisor::FadeOutMusic(f32 musicFadeFrames)
+{
+    f32 local_8;
+
+    if (EffectiveMusicMode() == MUSIC_MIDI)
+    {
+        if (g_Supervisor.midiOutput)
+        {
+            g_Supervisor.midiOutput->SetFadeOut(1000.0f * musicFadeFrames);
+        }
+    }
+    else
+    {
+        if (EffectiveMusicMode() == MUSIC_WAV)
+        {
+            if (this->effectiveFramerateMultiplier == 0.0f)
+            {
+                local_8 = musicFadeFrames;
+            }
+            else if (this->effectiveFramerateMultiplier > 1.0f)
+            {
+                local_8 = musicFadeFrames;
+            }
+            else
+            {
+                local_8 = musicFadeFrames / this->effectiveFramerateMultiplier;
+            }
+            g_SoundPlayer.PushCommand(AUDIO_FADEOUT, local_8, "");
+        }
+        else
+        {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+i32 Supervisor::IsSlowMode()
+{
+    return g_GameManager.defaultCfg != NULL && g_GameManager.defaultCfg->slowMode;
+}
+
+i32 Supervisor::EnableFog()
+{
+    g_AnmManager->Flush();
+    if (this->fogEnabled != 1)
+    {
+        this->fogEnabled = 1;
+        g_Supervisor.gfxDevice->Enable(CAPS_FOG);
+        return 1;
+    }
+
+    return 0;
+}
+
+i32 Supervisor::DisableFog()
+{
+    g_AnmManager->Flush();
+    if (this->fogEnabled)
+    {
+        this->fogEnabled = 0;
+        g_Supervisor.gfxDevice->Disable(CAPS_FOG);
+        return 1;
+    }
+
+    return 0;
+}
+
+void Supervisor::UpdateStartupTime()
+{
+    u32 timeSinceStartup;
+    u64 time;
+
+    time = SDL_GetTicks64();
+    if (time < this->lastTotalPlayTimeUpdate)
+    {
+        this->lastTotalPlayTimeUpdate = 0;
+    }
+    timeSinceStartup = time - this->lastTotalPlayTimeUpdate;
+    g_GameManager.plst.totalHours += timeSinceStartup / 3600000;
+    timeSinceStartup %= 3600000;
+    g_GameManager.plst.totalMinutes += timeSinceStartup / 60000;
+    timeSinceStartup %= 60000;
+    g_GameManager.plst.totalSeconds += timeSinceStartup / 1000;
+    timeSinceStartup %= 1000;
+    g_GameManager.plst.totalMilliseconds += timeSinceStartup;
+    if (g_GameManager.plst.totalMilliseconds >= 1000)
+    {
+        g_GameManager.plst.totalSeconds += g_GameManager.plst.totalMilliseconds / 1000;
+        g_GameManager.plst.totalMilliseconds %= 1000;
+    }
+    if (g_GameManager.plst.totalSeconds >= 60)
+    {
+        g_GameManager.plst.totalMinutes += g_GameManager.plst.totalSeconds / 60;
+        g_GameManager.plst.totalSeconds %= 60;
+    }
+    if (g_GameManager.plst.totalMinutes >= 60)
+    {
+        g_GameManager.plst.totalHours += g_GameManager.plst.totalMinutes / 60;
+        g_GameManager.plst.totalMinutes %= 60;
+    }
+    this->lastTotalPlayTimeUpdate = time;
+}
+
+void Supervisor::UpdateTime()
+{
+    u32 timeSinceLastTime;
+    u64 time;
+
+    time = SDL_GetTicks64();
+    if (time < this->currentTime)
+    {
+        this->currentTime = 0;
+    }
+    timeSinceLastTime = time - this->currentTime;
+    g_GameManager.plst.gameHours += timeSinceLastTime / 3600000;
+    timeSinceLastTime %= 3600000;
+    g_GameManager.plst.gameMinutes += timeSinceLastTime / 60000;
+    timeSinceLastTime %= 60000;
+    g_GameManager.plst.gameSeconds += timeSinceLastTime / 1000;
+    timeSinceLastTime %= 1000;
+    g_GameManager.plst.gameMilliseconds += timeSinceLastTime;
+    if (g_GameManager.plst.gameMilliseconds >= 1000)
+    {
+        g_GameManager.plst.gameSeconds += g_GameManager.plst.gameMilliseconds / 1000;
+        g_GameManager.plst.gameMilliseconds %= 1000;
+    }
+    if (g_GameManager.plst.gameSeconds >= 60)
+    {
+        g_GameManager.plst.gameMinutes += g_GameManager.plst.gameSeconds / 60;
+        g_GameManager.plst.gameSeconds %= 60;
+    }
+    if (g_GameManager.plst.gameMinutes >= 60)
+    {
+        g_GameManager.plst.gameHours += g_GameManager.plst.gameMinutes / 60;
+        g_GameManager.plst.gameMinutes %= 60;
+    }
+    this->currentTime = time;
+}

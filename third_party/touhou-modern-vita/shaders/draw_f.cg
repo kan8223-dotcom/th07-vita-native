@@ -1,0 +1,63 @@
+// Select a single operation path. Keep ordered-comparison/NaN semantics.
+float4 sourceColor(float source, float4 texel, float4 diffuse, float4 specular, float4 factor)
+{
+    if (!(source >= 0.5)) return diffuse;
+    if (!(source >= 1.5)) return texel;
+    if (!(source >= 2.5)) return factor;
+    return specular;
+}
+float4 selectArgument(float value, float4 texel, float4 diffuse, float4 specular, float4 factor)
+{
+    float source = value - floor(value / 16.0) * 16.0;
+    float4 color = sourceColor(source, texel, diffuse, specular, factor);
+    float complement = floor(value / 16.0) - floor(value / 32.0) * 2.0;
+    color = lerp(color, 1.0 - color, complement);
+    if (value >= 32.0) color = color.aaaa;
+    return color;
+}
+float4 combine(float mode, float4 a, float4 b, float4 texel, float4 diffuse, float4 factor)
+{
+    if (!(mode >= 0.5)) return diffuse;
+    if (!(mode >= 1.5)) return a;
+    if (!(mode >= 2.5)) return b;
+    if (!(mode >= 3.5)) return a * b;
+    if (!(mode >= 4.5)) return a * b * 2.0;
+    if (!(mode >= 5.5)) return a * b * 4.0;
+    if (!(mode >= 6.5)) return a + b;
+    if (!(mode >= 7.5)) return a + b - 0.5;
+    if (!(mode >= 8.5)) return (a + b - 0.5) * 2.0;
+    if (!(mode >= 9.5)) return a - b;
+    if (!(mode >= 10.5)) return a + b * (1.0 - a);
+    if (!(mode >= 11.5)) return lerp(b, a, diffuse.a);
+    if (!(mode >= 12.5)) return lerp(b, a, texel.a);
+    if (!(mode >= 13.5)) return lerp(b, a, factor.a);
+    if (!(mode >= 14.5)) return a + b * (1.0 - texel.a);
+    return lerp(b, a, diffuse.a);
+}
+void main(float2 uv : TEXCOORD0, float4 diffuse : TEXCOORD1,
+          float4 specular : TEXCOORD2, float4 fog : TEXCOORD3,
+          uniform sampler2D tex0, uniform float4 factor,
+          uniform float4 operations, uniform float4 arguments, uniform float4 alphaTest,
+          out float4 output : COLOR0)
+{
+    float4 texel = tex2D(tex0, uv);
+    float4 a = selectArgument(operations.z, texel, diffuse, specular, factor);
+    float4 b = selectArgument(operations.w, texel, diffuse, specular, factor);
+    float4 color = combine(operations.x, a, b, texel, diffuse, factor);
+    a = selectArgument(arguments.x, texel, diffuse, specular, factor);
+    b = selectArgument(arguments.y, texel, diffuse, specular, factor);
+    color.a = combine(operations.y, a, b, texel, diffuse, factor).a;
+    color = saturate(color);
+    float alpha = color.a * 255.0;
+    float ref = alphaTest.x;
+    float mode = alphaTest.y;
+    bool accepted = mode > 6.5 || (mode > 0.5 && mode < 1.5 && alpha < ref)
+        || (mode > 1.5 && mode < 2.5 && alpha == ref)
+        || (mode > 2.5 && mode < 3.5 && alpha <= ref)
+        || (mode > 3.5 && mode < 4.5 && alpha > ref)
+        || (mode > 4.5 && mode < 5.5 && alpha != ref)
+        || (mode > 5.5 && mode < 6.5 && alpha >= ref);
+    if (!accepted) discard;
+    color.rgb = lerp(fog.rgb, color.rgb, saturate(fog.w));
+    output = color;
+}
